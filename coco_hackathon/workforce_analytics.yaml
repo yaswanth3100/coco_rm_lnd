@@ -1,0 +1,518 @@
+name: workforce_analytics
+description: >
+  Semantic model for workforce analytics covering timesheets,
+  resource allocations, leave tracking, and employee skills.
+
+tables:
+  - name: dim_employee
+    description: Employee dimension with demographics and employment details
+    base_table:
+      database: WORKFORCE_ANALYTICS
+      schema: TRANSFORMED
+      table: DIM_EMPLOYEE
+    dimensions:
+      - name: employee_id
+        description: Unique employee identifier
+        expr: EMPLOYEE_ID
+        data_type: VARCHAR
+        unique: true
+      - name: first_name
+        description: Employee first name
+        expr: FIRST_NAME
+        data_type: VARCHAR
+      - name: last_name
+        description: Employee last name
+        expr: LAST_NAME
+        data_type: VARCHAR
+      - name: employee_name
+        synonyms:
+          - "name"
+          - "full name"
+        description: Full name of the employee
+        expr: FIRST_NAME || ' ' || LAST_NAME
+        data_type: VARCHAR
+      - name: department
+        description: Department the employee belongs to
+        expr: DEPARTMENT
+        data_type: VARCHAR
+        is_enum: true
+        sample_values:
+          - "Engineering"
+          - "Data Science"
+          - "Consulting"
+      - name: employment_status
+        description: Current employment status
+        expr: EMPLOYMENT_STATUS
+        data_type: VARCHAR
+        is_enum: true
+        sample_values:
+          - "Active"
+          - "Inactive"
+      - name: office_location
+        description: Office location of the employee
+        expr: OFFICE_LOCATION
+        data_type: VARCHAR
+        is_enum: true
+        sample_values:
+          - "New York"
+          - "London"
+          - "Chicago"
+    time_dimensions:
+      - name: date_of_hire
+        description: Date the employee was hired
+        expr: DATE_OF_HIRE
+        data_type: DATE
+    metrics:
+      - name: employee_count
+        description: Total number of employees
+        expr: COUNT(EMPLOYEE_ID)
+      - name: active_employee_count
+        description: Number of active employees
+        expr: COUNT(CASE WHEN EMPLOYMENT_STATUS = 'Active' THEN EMPLOYEE_ID END)
+
+  - name: dim_project
+    description: Project dimension with project details and client information
+    base_table:
+      database: WORKFORCE_ANALYTICS
+      schema: TRANSFORMED
+      table: DIM_PROJECT
+    dimensions:
+      - name: project_code
+        description: Unique project identifier code
+        expr: PROJECT_CODE
+        data_type: VARCHAR
+        unique: true
+      - name: project_title
+        description: Title or name of the project
+        expr: PROJECT_TITLE
+        data_type: VARCHAR
+      - name: project_category
+        description: Category of the project
+        expr: PROJECT_CATEGORY
+        data_type: VARCHAR
+        is_enum: true
+        sample_values:
+          - "Engineering"
+          - "Data Science"
+          - "Consulting"
+      - name: project_status
+        description: Current status of the project
+        expr: PROJECT_STATUS
+        data_type: VARCHAR
+        is_enum: true
+        sample_values:
+          - "Active"
+          - "Completed"
+          - "On Hold"
+      - name: client_name
+        description: Client name associated with the project
+        expr: CLIENT_NAME
+        data_type: VARCHAR
+    metrics:
+      - name: project_count
+        description: Total number of projects
+        expr: COUNT(PROJECT_CODE)
+      - name: active_project_count
+        description: Number of active projects
+        expr: COUNT(CASE WHEN PROJECT_STATUS = 'Active' THEN PROJECT_CODE END)
+
+  - name: dim_skill
+    description: Skill dimension - distinct skills from HR talent data
+    base_table:
+      database: WORKFORCE_ANALYTICS
+      schema: TRANSFORMED
+      table: DIM_SKILL
+    dimensions:
+      - name: skill_name
+        synonyms:
+          - "skill"
+          - "technology"
+        description: Unique skill name
+        expr: SKILL_NAME
+        data_type: VARCHAR
+        unique: true
+    metrics:
+      - name: skill_count
+        description: Total number of distinct skills
+        expr: COUNT(SKILL_NAME)
+
+  - name: fact_timesheet
+    description: Timesheet entries recording hours logged by employees against projects
+    base_table:
+      database: WORKFORCE_ANALYTICS
+      schema: TRANSFORMED
+      table: FACT_TIMESHEET
+    dimensions:
+      - name: timesheet_entry_id
+        description: Unique identifier for each timesheet entry
+        expr: TIMESHEET_ENTRY_ID
+        data_type: VARCHAR
+        unique: true
+      - name: employee_id
+        description: Identifier of the employee who logged the time
+        expr: EMPLOYEE_ID
+        data_type: VARCHAR
+      - name: project_code
+        description: Code of the project hours were logged against
+        expr: PROJECT_CODE
+        data_type: VARCHAR
+      - name: department
+        description: Department of the employee
+        expr: DEPARTMENT
+        data_type: VARCHAR
+      - name: office_location
+        description: Office location of the employee
+        expr: OFFICE_LOCATION
+        data_type: VARCHAR
+      - name: project_title
+        description: Title of the project
+        expr: PROJECT_TITLE
+        data_type: VARCHAR
+      - name: project_category
+        description: Category of the project
+        expr: PROJECT_CATEGORY
+        data_type: VARCHAR
+      - name: client_name
+        description: Client name for the project
+        expr: CLIENT_NAME
+        data_type: VARCHAR
+      - name: approval_status
+        description: Manager approval status
+        expr: APPROVAL_STATUS
+        data_type: VARCHAR
+        is_enum: true
+        sample_values:
+          - "Approved"
+          - "Pending"
+          - "Rejected"
+      - name: is_billable
+        description: Whether the hours are billable
+        expr: IS_BILLABLE
+        data_type: BOOLEAN
+    time_dimensions:
+      - name: entry_date
+        description: Date when the timesheet entry was recorded
+        expr: ENTRY_DATE
+        data_type: DATE
+      - name: week_commencing
+        description: Start date of the week
+        expr: WEEK_COMMENCING
+        data_type: DATE
+    facts:
+      - name: hours_logged
+        description: Number of hours logged
+        expr: HOURS_LOGGED
+        data_type: FLOAT
+    metrics:
+      - name: total_hours
+        description: Total hours logged
+        expr: SUM(HOURS_LOGGED)
+      - name: total_billable_hours
+        description: Total billable hours logged
+        expr: SUM(CASE WHEN IS_BILLABLE THEN HOURS_LOGGED ELSE 0 END)
+      - name: billable_utilization_rate
+        synonyms:
+          - "utilization"
+          - "billable rate"
+        description: Percentage of total hours that are billable
+        expr: SUM(CASE WHEN IS_BILLABLE THEN HOURS_LOGGED ELSE 0 END) / NULLIF(SUM(HOURS_LOGGED), 0) * 100
+      - name: timesheet_entry_count
+        description: Number of timesheet entries
+        expr: COUNT(TIMESHEET_ENTRY_ID)
+
+  - name: fact_resource_allocation
+    description: Resource allocation plans showing how employees are allocated to projects
+    base_table:
+      database: WORKFORCE_ANALYTICS
+      schema: TRANSFORMED
+      table: FACT_RESOURCE_ALLOCATION
+    dimensions:
+      - name: plan_id
+        description: Unique resource plan identifier
+        expr: PLAN_ID
+        data_type: VARCHAR
+        unique: true
+      - name: employee_id
+        description: Employee allocated to the project
+        expr: EMPLOYEE_ID
+        data_type: VARCHAR
+      - name: project_code
+        description: Project the employee is allocated to
+        expr: PROJECT_CODE
+        data_type: VARCHAR
+      - name: department
+        description: Department of the employee
+        expr: DEPARTMENT
+        data_type: VARCHAR
+      - name: office_location
+        description: Office location of the employee
+        expr: OFFICE_LOCATION
+        data_type: VARCHAR
+      - name: project_title
+        description: Title of the project
+        expr: PROJECT_TITLE
+        data_type: VARCHAR
+      - name: project_category
+        description: Category of the project
+        expr: PROJECT_CATEGORY
+        data_type: VARCHAR
+      - name: client_name
+        description: Client name for the project
+        expr: CLIENT_NAME
+        data_type: VARCHAR
+      - name: is_billable
+        description: Whether the allocation is billable
+        expr: IS_BILLABLE
+        data_type: BOOLEAN
+    time_dimensions:
+      - name: valid_from_date
+        description: Start date of the resource allocation
+        expr: VALID_FROM_DATE
+        data_type: DATE
+      - name: valid_to_date
+        description: End date of the resource allocation
+        expr: VALID_TO_DATE
+        data_type: DATE
+    facts:
+      - name: allocated_percent
+        description: Percentage of time allocated
+        expr: ALLOCATED_PERCENT
+        data_type: NUMBER
+    metrics:
+      - name: avg_allocation
+        description: Average allocation percentage
+        expr: AVG(ALLOCATED_PERCENT)
+      - name: total_allocations
+        description: Number of resource allocations
+        expr: COUNT(PLAN_ID)
+
+  - name: fact_leave
+    description: Employee leave requests and absences
+    base_table:
+      database: WORKFORCE_ANALYTICS
+      schema: TRANSFORMED
+      table: FACT_LEAVE
+    dimensions:
+      - name: request_id
+        description: Unique leave request identifier
+        expr: REQUEST_ID
+        data_type: VARCHAR
+        unique: true
+      - name: employee_id
+        description: Employee who requested leave
+        expr: EMPLOYEE_ID
+        data_type: VARCHAR
+      - name: department
+        description: Department of the employee
+        expr: DEPARTMENT
+        data_type: VARCHAR
+      - name: office_location
+        description: Office location of the employee
+        expr: OFFICE_LOCATION
+        data_type: VARCHAR
+      - name: absence_reason
+        description: Reason for the absence
+        expr: ABSENCE_REASON
+        data_type: VARCHAR
+        is_enum: true
+        sample_values:
+          - "Vacation"
+          - "Sick"
+          - "Personal"
+          - "Conference"
+      - name: leave_state
+        description: Current state of the leave request
+        expr: LEAVE_STATE
+        data_type: VARCHAR
+        is_enum: true
+        sample_values:
+          - "Approved"
+          - "Pending"
+          - "Rejected"
+    time_dimensions:
+      - name: absence_date
+        description: Date of the absence
+        expr: ABSENCE_DATE
+        data_type: DATE
+    facts:
+      - name: deducted_hours
+        description: Hours deducted for the absence
+        expr: DEDUCTED_HOURS
+        data_type: FLOAT
+    metrics:
+      - name: total_leave_hours
+        description: Total hours of leave taken
+        expr: SUM(DEDUCTED_HOURS)
+      - name: leave_request_count
+        description: Number of leave requests
+        expr: COUNT(REQUEST_ID)
+
+  - name: fact_skill_demand
+    description: Employee skill records linking employees to skills with proficiency levels
+    base_table:
+      database: WORKFORCE_ANALYTICS
+      schema: TRANSFORMED
+      table: FACT_SKILL_DEMAND
+    dimensions:
+      - name: employee_id
+        description: Employee identifier
+        expr: EMPLOYEE_ID
+        data_type: VARCHAR
+      - name: skill_name
+        synonyms:
+          - "skill"
+          - "skill tag"
+          - "technology"
+        description: Name of the skill
+        expr: SKILL_NAME
+        data_type: VARCHAR
+      - name: first_name
+        description: Employee first name
+        expr: FIRST_NAME
+        data_type: VARCHAR
+      - name: last_name
+        description: Employee last name
+        expr: LAST_NAME
+        data_type: VARCHAR
+      - name: department
+        description: Department of the employee
+        expr: DEPARTMENT
+        data_type: VARCHAR
+      - name: office_location
+        description: Office location of the employee
+        expr: OFFICE_LOCATION
+        data_type: VARCHAR
+    time_dimensions:
+      - name: last_updated_date
+        description: Date the skill rating was last updated
+        expr: LAST_UPDATED_DATE
+        data_type: DATE
+    facts:
+      - name: skill_level
+        description: Self-rated proficiency level from 1 to 5
+        expr: SKILL_LEVEL
+        data_type: NUMBER
+    metrics:
+      - name: avg_skill_level
+        description: Average self-rated skill level
+        expr: AVG(SKILL_LEVEL)
+      - name: skilled_employee_count
+        description: Number of employees with a given skill
+        expr: COUNT(DISTINCT EMPLOYEE_ID)
+
+relationships:
+  - name: timesheet_to_employee
+    left_table: fact_timesheet
+    right_table: dim_employee
+    relationship_columns:
+      - left_column: employee_id
+        right_column: employee_id
+  - name: timesheet_to_project
+    left_table: fact_timesheet
+    right_table: dim_project
+    relationship_columns:
+      - left_column: project_code
+        right_column: project_code
+  - name: resource_allocation_to_employee
+    left_table: fact_resource_allocation
+    right_table: dim_employee
+    relationship_columns:
+      - left_column: employee_id
+        right_column: employee_id
+  - name: resource_allocation_to_project
+    left_table: fact_resource_allocation
+    right_table: dim_project
+    relationship_columns:
+      - left_column: project_code
+        right_column: project_code
+  - name: leave_to_employee
+    left_table: fact_leave
+    right_table: dim_employee
+    relationship_columns:
+      - left_column: employee_id
+        right_column: employee_id
+  - name: skill_demand_to_employee
+    left_table: fact_skill_demand
+    right_table: dim_employee
+    relationship_columns:
+      - left_column: employee_id
+        right_column: employee_id
+  - name: skill_demand_to_skill
+    left_table: fact_skill_demand
+    right_table: dim_skill
+    relationship_columns:
+      - left_column: skill_name
+        right_column: skill_name
+
+verified_queries:
+  - name: total_hours_by_project
+    question: "What are the total hours logged per project?"
+    use_as_onboarding_question: true
+    sql: |
+      SELECT
+        project_title,
+        SUM(hours_logged) AS total_hours
+      FROM __fact_timesheet
+      GROUP BY project_title
+      ORDER BY total_hours DESC
+
+  - name: billable_utilization_by_department
+    question: "What is the billable utilization rate by department?"
+    use_as_onboarding_question: true
+    sql: |
+      SELECT
+        department,
+        SUM(CASE WHEN is_billable THEN hours_logged ELSE 0 END)
+          / NULLIF(SUM(hours_logged), 0) * 100 AS utilization_rate
+      FROM __fact_timesheet
+      GROUP BY department
+      ORDER BY utilization_rate DESC
+
+  - name: top_skills_by_employee_count
+    question: "What are the most common skills across employees?"
+    use_as_onboarding_question: true
+    sql: |
+      SELECT
+        skill_name,
+        COUNT(DISTINCT employee_id) AS employee_count,
+        ROUND(AVG(skill_level), 1) AS avg_proficiency
+      FROM __fact_skill_demand
+      GROUP BY skill_name
+      ORDER BY employee_count DESC
+
+  - name: leave_summary_by_department
+    question: "How much leave has each department taken?"
+    sql: |
+      SELECT
+        department,
+        SUM(deducted_hours) AS total_leave_hours,
+        COUNT(request_id) AS leave_count
+      FROM __fact_leave
+      GROUP BY department
+      ORDER BY total_leave_hours DESC
+
+  - name: employee_allocation_summary
+    question: "What is each employee's current project allocation?"
+    sql: |
+      SELECT
+        e.employee_name,
+        ra.project_title,
+        ra.allocated_percent,
+        ra.valid_from_date,
+        ra.valid_to_date
+      FROM __fact_resource_allocation ra
+      JOIN __dim_employee e ON ra.employee_id = e.employee_id
+      ORDER BY e.employee_name, ra.allocated_percent DESC
+
+  - name: pending_timesheet_approvals
+    question: "Which timesheet entries are still pending approval?"
+    sql: |
+      SELECT
+        e.employee_name,
+        ft.project_title,
+        ft.entry_date,
+        ft.hours_logged
+      FROM __fact_timesheet ft
+      JOIN __dim_employee e ON ft.employee_id = e.employee_id
+      WHERE ft.approval_status = 'Pending'
+      ORDER BY ft.entry_date DESC

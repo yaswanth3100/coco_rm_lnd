@@ -1,0 +1,112 @@
+version: 2
+
+models:
+  - name: dim_employee
+    description: Employee dimension
+    columns:
+      - name: employee_id
+        tests:
+          - not_null
+          - unique
+      - name: employment_status
+        tests:
+          - accepted_values:
+              values: ['Active', 'Inactive']
+
+  - name: dim_project
+    description: Project dimension
+    columns:
+      - name: project_code
+        tests:
+          - not_null
+          - unique
+      - name: project_status
+        tests:
+          - accepted_values:
+              values: ['Active', 'Completed', 'On Hold']
+
+  - name: dim_skill
+    description: Skill dimension
+    columns:
+      - name: skill_name
+        tests:
+          - not_null
+          - unique
+
+  - name: dim_date
+    description: Date dimension
+    columns:
+      - name: date_day
+        tests:
+          - not_null
+          - unique
+
+  - name: fact_timesheet
+    description: Timesheet fact - joins employee, project, and date dimensions
+    columns:
+      - name: timesheet_entry_id
+        tests:
+          - not_null
+          - unique
+      - name: employee_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_employee')
+              field: employee_id
+      - name: project_code
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_project')
+              field: project_code
+
+  - name: fact_resource_allocation
+    description: Resource allocation fact - joins employee and project dimensions
+    columns:
+      - name: plan_id
+        tests:
+          - not_null
+          - unique
+      - name: employee_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_employee')
+              field: employee_id
+      - name: project_code
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_project')
+              field: project_code
+
+  - name: fact_leave
+    description: Leave fact - joins employee and date dimensions
+    columns:
+      - name: request_id
+        tests:
+          - not_null
+          - unique
+      - name: employee_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_employee')
+              field: employee_id
+
+  - name: fact_skill_demand
+    description: Skill demand fact - joins employee and skill dimensions
+    columns:
+      - name: employee_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_employee')
+              field: employee_id
+      - name: skill_name
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_skill')
+              field: skill_name

@@ -1,0 +1,51 @@
+{
+    "path_count": 163,
+    "parsed_path_count": 163,
+    "static_analysis_path_count": 15,
+    "static_analysis_parsed_path_count": 15,
+    "is_partial_parse_enabled": true,
+    "is_static_analysis_enabled": true,
+    "read_files_elapsed": 0.08701044599996521,
+    "load_macros_elapsed": 0.937798991999955,
+    "parse_project_elapsed": 1.0552165649999665,
+    "patch_sources_elapsed": 0.010726408999971682,
+    "process_manifest_elapsed": 0.041771799999992254,
+    "load_all_elapsed": 2.279694766000034,
+    "projects": [
+        {
+            "project_name": "COCO_HACKATHON",
+            "elapsed": 1.032578543999989,
+            "parsers": [
+                {
+                    "parser": "model",
+                    "elapsed": 0.42084934700000076,
+                    "parsed_path_count": 15
+                },
+                {
+                    "parser": "test",
+                    "elapsed": 0.5990888619999737,
+                    "parsed_path_count": 3
+                }
+            ],
+            "parsed_path_count": 18
+        },
+        {
+            "project_name": "dbt_snowflake",
+            "elapsed": 0.010156403999985741,
+            "parsers": [],
+            "parsed_path_count": 0
+        },
+        {
+            "project_name": "dbt",
+            "elapsed": 0.01219771899997113,
+            "parsers": [
+                {
+                    "parser": "doc",
+                    "elapsed": 0.00034891500001776876,
+                    "parsed_path_count": 1
+                }
+            ],
+            "parsed_path_count": 1
+        }
+    ]
+}

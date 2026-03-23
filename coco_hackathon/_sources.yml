@@ -1,0 +1,13 @@
+version: 2
+
+sources:
+  - name: raw
+    database: WORKFORCE_ANALYTICS
+    schema: RAW
+    tables:
+      - name: HR_EMPLOYEE_MASTER
+      - name: HR_TALENT_SKILLS
+      - name: HR_LEAVE_REQUESTS
+      - name: TS_WEEKLY_SUBMISSIONS
+      - name: PM_RESOURCE_PLANNING
+      - name: PM_PROJECTS_LIST

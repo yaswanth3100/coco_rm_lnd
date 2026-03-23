@@ -1,0 +1,23 @@
+name: 'COCO_HACKATHON'
+version: '1.0.0'
+
+profile: 'COCO_HACKATHON'
+
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+  COCO_HACKATHON:
+    staging:
+      +schema: RAW
+      +materialized: view
+    marts:
+      +schema: TRANSFORMED
+      +materialized: table

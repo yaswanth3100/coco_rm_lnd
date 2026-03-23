@@ -1,0 +1,39 @@
+version: 2
+
+models:
+  - name: stg_employees
+    columns:
+      - name: employee_id
+        tests:
+          - not_null
+          - unique
+  - name: stg_projects
+    columns:
+      - name: project_code
+        tests:
+          - not_null
+          - unique
+  - name: stg_skills
+    columns:
+      - name: employee_id
+        tests:
+          - not_null
+  - name: stg_timesheets
+    columns:
+      - name: timesheet_entry_id
+        tests:
+          - not_null
+          - unique
+  - name: stg_resource_plans
+    columns:
+      - name: plan_id
+        tests:
+          - not_null
+          - unique
+  - name: stg_leave_requests
+    columns:
+      - name: request_id
+        tests:
+          - not_null
+          - unique
+

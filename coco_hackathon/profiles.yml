@@ -1,0 +1,12 @@
+COCO_HACKATHON:
+  target: dev
+  outputs:
+    dev:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT', 'ubb98031') }}"
+      user: "{{ env_var('SNOWFLAKE_USER', 'HACKATHON') }}"
+      role: ACCOUNTADMIN
+      database: WORKFORCE_ANALYTICS
+      warehouse: COCO_WH
+      schema: TRANSFORMED
+      threads: 4

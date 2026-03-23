@@ -1,0 +1,775 @@
+import streamlit as st
+import pandas as pd
+import json
+import re
+import os
+import tempfile
+from datetime import datetime
+import _snowflake
+from snowflake.snowpark.context import get_active_session
+from PyPDF2 import PdfReader
+
+# ─────────────────────────────────────────────
+# 1. Configuration & Constants
+# ─────────────────────────────────────────────
+st.set_page_config(layout="wide", page_title="COCO RM & LND Bot", page_icon="⚡")
+
+# --- Pipeline & Ingestion Constants ---
+PL_DB = "WORKFORCE_ANALYTICS"
+PL_SCHEMA = "RAW"
+PL_STAGE = "CSV_FILES_STG"
+PL_FQN = f"{PL_DB}.{PL_SCHEMA}"
+CORTEX_MODEL = 'llama3-8b'
+MAX_ROWS_EDITOR = 10000
+
+# --- Analytics & Semantic Constants ---
+AN_DB = "WORKFORCE_ANALYTICS"
+AN_SCHEMA = "TRANSFORMED"
+AN_STAGE = "SEMANTIC_MODELS"
+SEMANTIC_MODEL_FILE = f"@{AN_DB}.{AN_SCHEMA}.{AN_STAGE}/workforce_analytics.yaml"
+EMAIL_INTEGRATION = "COCO_EMAIL_INT"
+
+# ─────────────────────────────────────────────
+# 2. UI Styling & Session Init
+# ─────────────────────────────────────────────
+try:
+    session = get_active_session()
+except Exception as e:
+    st.error("⚠️ Could not establish Snowflake session. Are you running this inside Streamlit in Snowflake (SiS)?")
+    st.stop()
+
+# Initialize unified session states
+state_defaults = {
+    "cortex_cache": {},
+    "messages": [],
+    "last_df": None,
+    "doc_chunks": [],
+    "doc_embeddings": []
+}
+for key, default in state_defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+# ─────────────────────────────────────────────
+# 3. Core Helper Functions (Pipeline)
+# ─────────────────────────────────────────────
+@st.cache_data(ttl=600)
+def get_dynamic_schema():
+    query = f"""
+        SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE
+        FROM {PL_DB}.INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = '{PL_SCHEMA}'
+        ORDER BY TABLE_NAME, ORDINAL_POSITION
+    """
+    try:
+        df = session.sql(query).to_pandas()
+        t_map, t_types = {}, {}
+        
+        for table, group in df.groupby('TABLE_NAME'):
+            t_map[table] = group['COLUMN_NAME'].tolist()
+            type_dict = {}
+            for _, row in group.iterrows():
+                col, raw_type = row['COLUMN_NAME'], str(row['DATA_TYPE']).upper()
+                if raw_type in ['TEXT', 'VARCHAR']: val_type = "STRING"
+                elif raw_type in ['NUMBER', 'INTEGER', 'BIGINT']: val_type = "INTEGER"
+                elif raw_type in ['FLOAT', 'DOUBLE', 'REAL']: val_type = "FLOAT"
+                elif raw_type == 'BOOLEAN': val_type = "BOOLEAN"
+                elif raw_type == 'DATE': val_type = "DATE"
+                elif raw_type == 'ARRAY': val_type = "ARRAY"
+                else: val_type = "STRING"
+                type_dict[col] = val_type
+            t_types[table] = type_dict
+        return t_map, t_types
+    except Exception as e:
+        st.error(f"Failed to fetch schema metadata: {e}")
+        return {}, {}
+
+TABLE_MAP, TABLE_TYPES = get_dynamic_schema()
+
+@st.cache_data(ttl=300)
+def get_stage_files():
+    try:
+        rows = session.sql(f"LIST @{PL_FQN}.{PL_STAGE}").collect()
+        files = {}
+        for r in rows:
+            name = str(r["name"]).split("/")[-1]
+            tbl = name.replace(".csv", "").strip().upper()
+            files[tbl] = {"name": name, "size": r["size"], "last_modified": str(r["last_modified"])}
+        return files
+    except Exception: return {}
+
+def get_csv_header(file_name):
+    try:
+        df = session.read.option("SKIP_HEADER", 0).option("FIELD_OPTIONALLY_ENCLOSED_BY", '"').csv(f"@{PL_FQN}.{PL_STAGE}/{file_name}")
+        rows = df.limit(1).collect()
+        if rows: return [str(val).strip().upper() for val in rows[0] if val is not None and str(val).strip()]
+    except Exception: pass
+    return []
+
+def get_full_csv_as_pandas(file_name, columns):
+    if not columns: return pd.DataFrame()
+    try:
+        df_snowpark = session.read.option("SKIP_HEADER", 1).option("FIELD_OPTIONALLY_ENCLOSED_BY", '"').csv(f"@{PL_FQN}.{PL_STAGE}/{file_name}")
+        pd_df = df_snowpark.limit(MAX_ROWS_EDITOR).to_pandas()
+        num_cols = min(len(pd_df.columns), len(columns))
+        pd_df = pd_df.iloc[:, :num_cols]
+        pd_df.columns = columns[:num_cols]
+        return pd_df
+    except Exception: return pd.DataFrame()
+
+def save_dataframe_to_stage(df, file_name):
+    tmp_dir = tempfile.gettempdir()
+    file_path = os.path.join(tmp_dir, file_name)
+    df.to_csv(file_path, index=False, header=True)
+    session.file.put(file_path, f"@{PL_FQN}.{PL_STAGE}", auto_compress=False, overwrite=True)
+    get_stage_files.clear() 
+
+def detect_schema_drift(table_name, csv_columns):
+    expected = TABLE_MAP.get(table_name, [])
+    expected_upper = [c.upper() for c in expected]
+    csv_upper = [c.upper() for c in csv_columns]
+    
+    return {
+        "expected": expected_upper,
+        "csv_columns": csv_upper,
+        "missing_in_csv": [c for c in expected_upper if c not in csv_upper],
+        "extra_in_csv": [c for c in csv_upper if c not in expected_upper],
+        "col_count_match": len(expected_upper) == len(csv_upper),
+        "order_match": csv_upper == expected_upper,
+        "has_drift": bool([c for c in expected_upper if c not in csv_upper] or [c for c in csv_upper if c not in expected_upper]),
+    }
+
+def _try_parse_date(val, fmt):
+    try:
+        datetime.strptime(val, fmt)
+        return True
+    except ValueError: return False
+
+def validate_data(table_name, df_data):
+    raw_issues, expected_types = [], TABLE_TYPES.get(table_name, {})
+    if df_data.empty: return [], [{"severity": "ERROR", "message": "File is empty or has no data rows"}]
+
+    col_mapping = {c: c for c in df_data.columns if c in expected_types}
+    for idx, row in df_data.iterrows():
+        for col_name in col_mapping:
+            val = str(row[col_name]).strip() if pd.notna(row[col_name]) else ""
+            dtype = expected_types.get(col_name, "STRING")
+            if val == "" or val.upper() in ("NONE", "NULL", "NAN"): continue
+            
+            issue_found, sev, msg = False, "", ""
+            if dtype == "DATE":
+                if not any([_try_parse_date(val, fmt) for fmt in ["%Y-%m-%d", "%m/%d/%Y", "%d-%m-%Y", "%Y/%m/%d"]]):
+                    issue_found, sev, msg = True, "WARNING", f"'{val}' may not parse as DATE"
+            elif dtype in ("INTEGER", "NUMBER"):
+                try: int(float(val))
+                except ValueError: issue_found, sev, msg = True, "ERROR", f"'{val}' is not a valid integer"
+            elif dtype == "FLOAT":
+                try: float(val)
+                except ValueError: issue_found, sev, msg = True, "ERROR", f"'{val}' is not a valid number"
+            elif dtype == "BOOLEAN":
+                if val.upper() not in ("TRUE", "FALSE", "1", "0", "YES", "NO", "T", "F"):
+                    issue_found, sev, msg = True, "ERROR", f"'{val}' is not a valid boolean"
+                    
+            if issue_found:
+                raw_issues.append({"row_idx": idx, "col_name": col_name, "severity": sev, "message": f"Column {col_name} (Row {idx+2}): {msg}"})
+
+    seen, unique_issues = set(), []
+    for i in raw_issues:
+        base_msg = re.sub(r"\(Row \d+\):", "", i["message"]).strip()
+        if base_msg not in seen:
+            seen.add(base_msg)
+            unique_issues.append(i)
+    return raw_issues, unique_issues
+
+def generate_cortex_healing_suggestions(table_name, drift_info, data_issues):
+    if not drift_info["has_drift"] and not data_issues and drift_info["order_match"]: 
+        return []
+    
+    # 1. Trim the payload size to the absolute minimum required context
+    trimmed_drift = {
+        "missing": drift_info.get("missing_in_csv", []),
+        "extra": drift_info.get("extra_in_csv", [])
+    }
+    
+    # Limit to top 3 issues and only send the core message string
+    limited_issues = [i["message"] for i in data_issues[:3]] if data_issues else []
+    
+    # 2. Use [INST] tags and highly restrictive instructions to eliminate generation lag
+    prompt = f"""
+    [INST]
+    You are a Snowflake Data Engineer. Fix this pipeline failure for `{PL_FQN}.{table_name}`.
+    DRIFT: {json.dumps(trimmed_drift)}
+    ERRORS: {json.dumps(limited_issues)}
+    
+    Output ONLY a valid JSON array. Do not include markdown tags, greetings, or explanations. Format exactly like this:
+    [
+      {{"type": "SQL", "description": "Short desc", "action": "ALTER TABLE ..."}},
+      {{"type": "FILE_FIX", "description": "Short desc", "action": "Fix instructions"}}
+    ]
+    [/INST]
+    """
+    
+    try:
+        escaped_prompt = prompt.replace("'", "''")
+        # Ensure we are hitting the fastest capable model available in Cortex
+        cortex_query = f"SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-8b', '{escaped_prompt}') AS LLM_RESPONSE"
+        
+        llm_result = session.sql(cortex_query).collect()[0]["LLM_RESPONSE"]
+        
+        clean_json_str = re.sub(r"```json\s*", "", llm_result)
+        clean_json_str = re.sub(r"```\s*", "", clean_json_str).strip()
+        
+        return json.loads(clean_json_str)
+    except Exception as e:
+        return [{"type": "WARNING", "description": "LLM Analysis failed.", "action": str(e)}]
+
+def load_file(table_name, file_name, on_error="CONTINUE"):
+    try:
+        result = session.sql(f"""
+            COPY INTO {PL_FQN}.{table_name}
+            FROM @{PL_FQN}.{PL_STAGE}/{file_name}
+            FILE_FORMAT = (TYPE='CSV' SKIP_HEADER=1 FIELD_OPTIONALLY_ENCLOSED_BY='"' NULL_IF=('', 'NULL', 'null') ERROR_ON_COLUMN_COUNT_MISMATCH=FALSE)
+            ON_ERROR = '{on_error}' PURGE = FALSE
+        """).collect()
+        if result: return {"status": "SUCCESS", "rows_loaded": result[0]["rows_loaded"], "errors_seen": result[0]["errors_seen"], "first_error": str(result[0]["first_error"])}
+    except Exception as e: return {"status": "FAILED", "error": str(e)}
+
+
+# ─────────────────────────────────────────────
+# 4. Core Helper Functions (Analytics & RAG)
+# ─────────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def cortex_embed(text: str) -> list:
+    return list(session.sql("SELECT SNOWFLAKE.CORTEX.EMBED_TEXT_768('e5-base-v2', ?)", params=[text]).collect()[0][0])
+
+def cortex_complete(model: str, prompt: str) -> str:
+    return session.sql("SELECT SNOWFLAKE.CORTEX.COMPLETE(?, ?)", params=[model, prompt]).collect()[0][0]
+
+def call_cortex_analyst(history: list):
+    response = _snowflake.send_snow_api_request(
+        "POST", "/api/v2/cortex/analyst/message", {}, {},
+        {"messages": history, "semantic_model_file": SEMANTIC_MODEL_FILE}, {}, 30000,
+    )
+    status, raw = response.get("status", 200), response.get("content", "{}")
+    if isinstance(raw, str):
+        try: raw = json.loads(raw)
+        except Exception: return [], f"Could not parse API response: {raw[:200]}"
+    if status >= 400: return [], f"(Code {raw.get('code', status)}) {raw.get('message', 'Unknown error.')}"
+    return raw.get("message", {}).get("content", []), None
+
+def get_text_chunks(text: str, chunk_size: int = 1000, overlap: int = 200) -> list:
+    chunks, start = [], 0
+    while start < len(text):
+        chunks.append(text[start : start + chunk_size])
+        start += chunk_size - overlap
+    return chunks
+
+def cosine_similarity(v1: list, v2: list) -> float:
+    dot, mag = sum(a * b for a, b in zip(v1, v2)), (sum(a ** 2 for a in v1) ** 0.5) * (sum(b ** 2 for b in v2) ** 0.5)
+    return dot / mag if mag else 0.0
+
+def safe_text(text: str) -> str: return text.encode("utf-8", "ignore").decode("utf-8")
+
+
+# ─────────────────────────────────────────────
+# 5. Application Routing & Views
+# ─────────────────────────────────────────────
+st.sidebar.title("COCO RM & LND Bot")
+st.sidebar.caption("Unified Workspace Platform")
+
+app_mode = st.sidebar.radio("Navigation", [
+    "Data Pipeline", 
+    "Data Analyst", 
+    "Insight Library",
+    "Document Intel & Matching", 
+    "Distribute Insights"
+], label_visibility="hidden")
+st.sidebar.divider()
+
+if app_mode == "Data Pipeline":
+    st.title("Data Pipeline Management")
+    st.info(f"**Target DB/Schema:** `{PL_FQN}` | **Staging Area:** `@{PL_FQN}.{PL_STAGE}`")
+    
+    with st.sidebar:
+        st.markdown("### Pipeline Controls")
+        if st.button("Refresh Stage Directory", use_container_width=True):
+            get_stage_files.clear()
+            get_dynamic_schema.clear()
+            st.toast("Stage & Schema directory refreshed.")
+            st.rerun()
+        
+        st.write("") 
+        stage_files = get_stage_files()
+        matched_files = [f for f in stage_files if f in TABLE_MAP]
+        col1, col2 = st.columns(2)
+        col1.metric("Stage Files", len(stage_files))
+        col2.metric("Matched", len(matched_files))
+        st.write("") 
+        selected_tbl = st.selectbox("Select Target Table:", ["-- Select Table --"] + sorted(matched_files))
+
+    if selected_tbl == "-- Select Table --":
+        st.info("Select a table from the sidebar to inspect its file, analyze schema drift, fix data issues, and load it into Snowflake.")
+    else:
+        file_info = stage_files[selected_tbl]
+        file_name = file_info["name"]
+        
+        st.subheader(f"Table: `{selected_tbl}`")
+        st.caption(f"**File:** `{file_name}` | **Size:** {round(file_info['size'] / 1024, 2)} KB |  **Modified:** {file_info['last_modified']}")
+
+        csv_cols = get_csv_header(file_name)
+        raw_df = get_full_csv_as_pandas(file_name, csv_cols)
+        raw_issues, data_issues_summary = validate_data(selected_tbl, raw_df)
+        drift = detect_schema_drift(selected_tbl, csv_cols)
+
+        status_col1, status_col2 = st.columns(2)
+        with status_col1:
+            if drift["has_drift"]: st.error("SCHEMA DRIFT DETECTED")
+            elif not drift["order_match"]: st.warning("Column Order Mismatch")
+            else: st.success("Schema Match OK")
+        with status_col2:
+            if data_issues_summary: st.warning(f"{len(data_issues_summary)} Data Quality Violations")
+            else: st.success("Data Quality Pre-check Passed")
+        st.divider()
+
+        col_schema, col_ai = st.columns([1, 1.2], gap="large")
+        with col_schema:
+            st.markdown("#### Schema Comparison")
+            drift_df = pd.DataFrame(index=range(max(len(drift["expected"]), len(drift["csv_columns"]))))
+            drift_df["Expected (Target)"] = pd.Series(drift["expected"])
+            drift_df["Actual (CSV)"] = pd.Series(drift["csv_columns"])
+            
+            def highlight_diff(row):
+                if pd.isna(row['Expected (Target)']) or pd.isna(row['Actual (CSV)']) or row['Expected (Target)'] != row['Actual (CSV)']:
+                    return ['background-color: #4a1919'] * len(row) 
+                return [''] * len(row)
+            st.dataframe(drift_df.style.apply(highlight_diff, axis=1), use_container_width=True, hide_index=True)
+
+        with col_ai:
+            st.markdown("#### Cortex AI Self-Healing")
+            if not drift["has_drift"] and not data_issues_summary:
+                st.info("No critical issues found. Pipeline is healthy and ready to load.")
+            else:
+                if st.button("Generate AI Fixes", type="primary"):
+                    with st.spinner("Analyzing issues..."):
+                        st.session_state.cortex_cache[selected_tbl] = generate_cortex_healing_suggestions(selected_tbl, drift, data_issues_summary)
+                
+                if selected_tbl in st.session_state.cortex_cache:
+                    for idx, s in enumerate(st.session_state.cortex_cache[selected_tbl]):
+                        with st.container(border=True):
+                            if s.get("type") == "SQL":
+                                st.markdown(f"**Suggestion:** {s.get('description')}")
+                                st.code(s.get("action"), language="sql")
+                                if st.button(f"Execute SQL Fix", key=f"sql_{idx}_{selected_tbl}"):
+                                    try:
+                                        session.sql(s["action"]).collect()
+                                        st.toast("SQL executed successfully.")
+                                        del st.session_state.cortex_cache[selected_tbl]
+                                        st.rerun()
+                                    except Exception as e: st.error(f"Failed: {e}")
+                            else:
+                                st.markdown(f"**Data Fix Required:** {s.get('description')}")
+                                st.info(s.get('action'))
+        st.divider()
+
+        st.markdown("#### Data Editor & Validation")
+        bad_rows = sorted(list(set([issue['row_idx'] for issue in raw_issues])))
+        if len(bad_rows) > 25:
+            st.error(f"Too Many Data Errors ({len(bad_rows)} rows affected). Please fix locally.")
+        else:
+            display_df = raw_df.copy()
+            
+            display_df["ISSUES"] = ""
+            
+            for issue in raw_issues:
+                r = issue['row_idx']
+                col = issue['col_name']
+                msg = issue['message'].split(":", 1)[-1].strip() 
+                
+                current_issues = display_df.at[r, "ISSUES"]
+                separator = " | " if current_issues else ""
+                display_df.at[r, "ISSUES"] = f"{current_issues}{separator}[{col}] {msg}"
+
+            if bad_rows and st.radio("Select View:", ["Show Problematic Rows Only", "Show All Rows"], horizontal=True) == "Show Problematic Rows Only":
+                display_df = display_df.loc[bad_rows] 
+
+            display_df = display_df.fillna("").astype(str)
+
+            edited_display_df = st.data_editor(
+                display_df, 
+                num_rows="dynamic", 
+                use_container_width=True, 
+                height=400,
+                disabled=["ISSUES"] 
+            )
+
+            if st.button("Save Edits back to Stage"):
+                with st.spinner("Uploading edited file to stage..."):
+                    if "ISSUES" in edited_display_df.columns:
+                        edited_display_df = edited_display_df.drop(columns=["ISSUES"])
+                    
+                    raw_df.update(edited_display_df)
+                    save_dataframe_to_stage(raw_df, file_name)
+                    st.toast("File successfully overwritten in stage.")
+                    st.rerun()
+        st.divider()
+
+        st.markdown("#### Execute Load Job")
+        if drift["has_drift"]: st.error("Schema drift is unresolved. Apply SQL fixes above or edit the file before loading.")
+        col_btn, col_info = st.columns([1, 2])
+        with col_btn:
+            if st.button("Load into Target Table", type="primary", use_container_width=True):
+                with st.spinner(f"Loading `{file_name}` into `{selected_tbl}`..."):
+                    res = load_file(selected_tbl, file_name)
+                    if res.get("status") == "SUCCESS":
+                        if res["errors_seen"] > 0: st.warning(f"Loaded {res['rows_loaded']} rows. {res['errors_seen']} errors.\n\nFirst: {res.get('first_error')}")
+                        else: 
+                            st.success(f"Successfully loaded {res['rows_loaded']} rows into {selected_tbl}.")
+                    else: st.error(f"Load failed: {res.get('error')}")
+        with col_info: st.info("The COPY command skips the header row and continues on error. Invalid rows will be skipped.")
+
+elif app_mode == "Data Analyst":
+    st.title("Data Analyst")
+    st.info("Chat with your workforce data to gain actionable insights into employee skills and projects.")
+
+    st.write("")
+    col_title, col_btn = st.columns([4, 1])
+    with col_btn:
+        if st.button("Clear Chat", use_container_width=True):
+            st.session_state.messages, st.session_state.last_df = [], None
+            st.rerun()
+
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(safe_text(msg['content']))
+            if msg.get("has_df") and msg.get("df") is not None: st.dataframe(msg["df"], use_container_width=True, hide_index=True)
+            if msg.get("sql"):
+                with st.expander("View Generated SQL"): st.code(msg["sql"], language="sql")
+
+    prompt = st.chat_input("Ask about employee skills, projects, or logged hours...")
+    
+    audio_hook = getattr(st, "audio_input", getattr(st, "experimental_audio_input", None))
+    audio_val = audio_hook("Voice Recording") if audio_hook else None
+
+    active_prompt = prompt
+    if audio_val and st.session_state.get("last_audio_demo") != audio_val:
+        st.session_state["last_audio_demo"] = audio_val
+        import tempfile, os, json
+        with st.spinner("Transcribing audio via Snowflake AI_TRANSCRIBE..."):
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmpf:
+                    tmpf.write(audio_val.getvalue())
+                    tmp_path = tmpf.name
+                
+                sse_stage = "AUDIO_TEMP_SSE_STG"
+                try:
+                    session.sql(f"CREATE STAGE IF NOT EXISTS {PL_DB}.{PL_SCHEMA}.{sse_stage} ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE')").collect()
+                except Exception:
+                    pass 
+                
+                stage_url = f"@{PL_DB}.{PL_SCHEMA}.{sse_stage}"
+                session.file.put(tmp_path, stage_url, auto_compress=False, overwrite=True)
+                
+                filename = os.path.basename(tmp_path)
+                sql = f"SELECT AI_TRANSCRIBE(TO_FILE('{stage_url}', '{filename}'))"
+                
+                result = session.sql(sql).collect()[0][0]
+                
+                if isinstance(result, str):
+                    parsed = json.loads(result)
+                    transcription = parsed.get("text", result)
+                else:
+                    transcription = result.get("text", str(result))
+                
+                active_prompt = transcription
+                
+            except Exception as e:
+                st.error(f"Transcription failed: {e}")
+                active_prompt = None
+
+    if active_prompt:
+        st.session_state.messages.append({"role": "user", "content": active_prompt})
+        with st.chat_message("user"): st.markdown(active_prompt)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Analyzing with Cortex..."):
+                try:
+                    api_history = [{"role": "analyst" if m["role"] == "assistant" else "user", "content": [{"type": "text", "text": m["content"]}]} for m in st.session_state.messages if not any(word in m["content"] for word in ["Error", "failed"])]
+                    items, error = call_cortex_analyst(api_history)
+
+                    if error:
+                        err_msg = f"Cortex Analyst couldn't answer:\n\n{error}"
+                        st.markdown(err_msg)
+                        st.session_state.messages.append({"role": "assistant", "content": err_msg, "has_df": False})
+                    else:
+                        ans_text, ans_df, ans_sql = "", None, None
+                        for item in items:
+                            itype = item.get("type", "")
+                            if itype == "text": ans_text += item.get("text", "") + "\n"
+                            elif itype == "sql":
+                                ans_sql = item.get("statement", "")
+                                if ans_sql:
+                                    try:
+                                        ans_df = session.sql(ans_sql).to_pandas()
+                                        st.session_state.last_df = ans_df
+                                    except Exception as sql_err: ans_text += f"\n\nSQL Error: {sql_err}"
+                            elif itype == "suggestions" and item.get("suggestions", []):
+                                ans_text += "\n**Try asking:**\n" + "\n".join(f"- {s}" for s in item.get("suggestions", []))
+
+                        st.markdown(ans_text.strip())
+                        if ans_df is not None: st.dataframe(ans_df, use_container_width=True, hide_index=True)
+                        if ans_sql:
+                            with st.expander("View Generated SQL"): st.code(ans_sql, language="sql")
+                        
+                        st.session_state.messages.append({"role": "assistant", "content": ans_text.strip(), "sql": ans_sql, "has_df": ans_df is not None, "df": ans_df})
+                except Exception as e:
+                    err_msg = f"Unexpected error: {e}"
+                    st.markdown(err_msg)
+                    st.session_state.messages.append({"role": "assistant", "content": err_msg, "has_df": False})
+
+elif app_mode == "Document Intel & Matching":
+    st.title("Document Intel & Matching")
+    st.info("Upload documents to extract intelligence and intelligently match against employee technical skills.")
+
+    st.write("")
+    col_left, col_right = st.columns([1, 1.5], gap="large")
+    with col_left:
+        st.markdown("#### Document Context Upload")
+        with st.container(border=True):
+            uploaded_file = st.file_uploader("Upload Document", type=["txt", "pdf"], key="file_uploader", label_visibility="hidden")
+            if uploaded_file is not None:
+                if not st.session_state.doc_chunks:
+                    document_text = ""
+                    with st.status("Processing Document...", expanded=True) as status:
+                        if uploaded_file.name.endswith(".pdf"):
+                            try:
+                                for page in PdfReader(uploaded_file).pages:
+                                    if extracted := page.extract_text(): document_text += extracted + "\n"
+                            except Exception as e: st.error(f"Error reading PDF: {e}")
+                        else: document_text = uploaded_file.getvalue().decode("utf-8")
+
+                        if document_text:
+                            chunks = get_text_chunks(document_text)
+                            st.session_state.doc_chunks = chunks
+                            progress_bar, embeddings = st.progress(0), []
+                            for i, chunk in enumerate(chunks):
+                                embeddings.append(cortex_embed(chunk))
+                                progress_bar.progress((i + 1) / len(chunks))
+                            st.session_state.doc_embeddings = embeddings
+                            status.update(label="Document Processed Successfully.", state="complete", expanded=False)
+            elif st.session_state.doc_chunks:
+                st.session_state.doc_chunks, st.session_state.doc_embeddings = [], []
+
+    with col_right:
+        st.markdown("#### Analysis & Matching")
+        if not st.session_state.doc_chunks: st.info("Please upload a document to begin analysis.")
+        else:
+            with st.container(border=True):
+                search_query = st.text_input("Ask a question about the document:")
+                if st.button("Search Context", type="secondary") and search_query:
+                    with st.spinner("Searching document vectors..."):
+                        try:
+                            query_embedding = cortex_embed(search_query)
+                            similarities = sorted([(cosine_similarity(query_embedding, emb), chunk) for emb, chunk in zip(st.session_state.doc_embeddings, st.session_state.doc_chunks)], key=lambda x: x[0], reverse=True)
+                            retrieved_context = "\n\n...[SNIP]...\n\n".join([item[1] for item in similarities[:3]])
+                            rag_prompt = f"You are a helpful analyst. Answer the user's question using ONLY the retrieved document context below.\n--- RETRIEVED CONTEXT ---\n{retrieved_context}\n-------------------------\nQuestion: {search_query}"
+                            response = cortex_complete("llama3.1-8b", rag_prompt)
+                            st.success("Analysis Complete")
+                            st.markdown(response)
+                            with st.expander("View Retrieved Source"): st.caption(retrieved_context)
+                        except Exception as e: st.error(f"RAG Search Failed: {e}")
+
+            st.write("") 
+            st.markdown("#### Intelligent Employee Matching")
+            if st.button("Find Employees Matching Document Tech Stack", type="primary", use_container_width=True):
+                with st.spinner("Extracting tech stack and matching profiles..."):
+                    context = "\n\n".join(st.session_state.doc_chunks[:5])
+                    extract_prompt = f"Extract ONLY the technology stack (languages, frameworks, tools, DBs, cloud) mentioned below. Return ONLY a comma-separated list. --- DOCUMENT ---\n{context}"
+                    try:
+                        raw_tech_csv = cortex_complete("llama3.1-8b", extract_prompt).replace('`', '').replace('*', '').replace('\n', '').strip()
+                        st.info(f"**Detected Tech Stack:** `{raw_tech_csv}`")
+                        tech_list = [t.strip().upper() for t in raw_tech_csv.split(",") if t.strip()]
+                        
+                        if tech_list:
+                            placeholders = ", ".join("'" + t.replace("'", "''") + "'" for t in tech_list)
+                            sql = f"""
+                                WITH MatchedSkills AS (
+                                    SELECT e.FIRST_NAME, e.LAST_NAME, e.DEPARTMENT, s.SKILL_TAG
+                                    FROM {AN_DB}.{AN_SCHEMA}.DIM_EMPLOYEE e
+                                    JOIN {PL_DB}.{PL_SCHEMA}.STG_SKILLS s ON e.EMPLOYEE_ID = s.EMPLOYEE_ID
+                                    WHERE UPPER(s.SKILL_TAG) IN ({placeholders})
+                                ),
+                                EmployeeSkillCounts AS (
+                                    SELECT FIRST_NAME, LAST_NAME, DEPARTMENT, COUNT(DISTINCT SKILL_TAG) AS MATCHED_SKILL_COUNT,
+                                        LISTAGG(DISTINCT SKILL_TAG, ', ') WITHIN GROUP (ORDER BY SKILL_TAG) AS MATCHED_SKILLS
+                                    FROM MatchedSkills GROUP BY FIRST_NAME, LAST_NAME, DEPARTMENT
+                                )
+                                SELECT RANK() OVER (ORDER BY MATCHED_SKILL_COUNT DESC) AS RANK, *
+                                FROM EmployeeSkillCounts ORDER BY RANK ASC
+                            """
+                            df = session.sql(sql).to_pandas()
+                            if not df.empty:
+                                st.dataframe(df, use_container_width=True, hide_index=True)
+                                st.session_state.last_df = df
+                            else: st.warning("No employees found matching these specific skills.")
+                        else: st.warning("No technical skills were detected in the document.")
+                    except Exception as e: st.error(f"Error querying database: {e}")
+
+elif app_mode == "Distribute Insights":
+    st.title("Distribute Insights")
+    st.info("Securely share generated insights and analytics tables via email.")
+
+    st.write("")
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        st.markdown("#### Distribute Insights via Email")
+        with st.container(border=True):
+            st.write("Share the latest analytics table preview securely.")
+            recipient = st.text_input("Recipient Email", "yarraveeralakshmi123@gmail.com")
+            if st.session_state.last_df is not None:
+                st.markdown("**Data Preview:**")
+                st.dataframe(st.session_state.last_df, use_container_width=True, hide_index=True)
+                if st.button("Send Report", type="primary"):
+                    with st.spinner("Dispatching email..."):
+                        try:
+                            session.sql(f"CALL SYSTEM$SEND_EMAIL('{EMAIL_INTEGRATION}', '{recipient}', 'COCO Workforce Analytics Report', $${st.session_state.last_df.to_string(index=False)}$$)").collect()
+                            st.success(f"Successfully sent report to {recipient}.")
+                        except Exception as e: st.error(f"Failed to send email: {e}")
+            else: st.info("No data available to email. Please run a query in the Chat or RAG tabs first.")
+
+elif app_mode == "Insight Library":
+    st.title("Insight Library")
+    st.info("Instantly fetch pre-defined Cortex Analyst insights across different domains of your workforce data.")
+
+    insight_categories = {
+        "Headcount & Demographics": [
+            "How many total employees are there?",
+            "How many employees are in each department?",
+            "Which department has the most employees?",
+            "Which department has the fewest employees?",
+            "List all unique departments",
+            "How many employees were hired in the last 6 months?",
+            "What is the employee count trend by month?",
+            "Show me the ratio of employees across departments"
+        ],
+        "Skills Analysis": [
+            "What are the top 10 most common skills?",
+            "What are the rarest skills across the organization?",
+            "How many unique skills exist in the system?",
+            "Which employees have the most skills?",
+            "What is the average number of skills per employee?",
+            "Show me all employees who know Python",
+            "Which employees have both SQL and JavaScript skills?",
+            "What skills does the Engineering department have?",
+            "Which departments have employees with AWS skills?",
+            "List all employees with machine learning skills",
+            "What are the top 5 skills in the Marketing department?",
+            "Which skills are found in only one department?",
+            "How many employees know Snowflake?",
+            "Show employees with more than 5 skills",
+            "What is the skill distribution across all departments?",
+            "Which employees have cloud-related skills (AWS, Azure, GCP)?",
+            "What percentage of employees know SQL?"
+        ],
+        "Projects & Assignments": [
+            "How many active projects are there?",
+            "Which project has the most team members?",
+            "List all employees assigned to no projects",
+            "Which employees work on multiple projects?",
+            "What is the average team size per project?",
+            "Show me all projects and their member counts",
+            "Which department contributes to the most projects?",
+            "List the projects with the fewest assigned employees"
+        ],
+        "Hours & Productivity": [
+            "What are the total hours logged across all projects?",
+            "Which employee has logged the most hours?",
+            "What is the average hours logged per employee?",
+            "Which project has the highest total hours logged?",
+            "Show hours logged by department",
+            "Who are the top 10 employees by hours logged?",
+            "What is the total hours logged per month?",
+            "Which project has the lowest hours logged?",
+            "Show average hours logged per employee by department",
+            "What is the month-over-month change in hours logged?"
+        ],
+        "Cross-Domain Insights": [
+            "Which employees have the most skills AND the most hours logged?",
+            "Show departments ranked by total hours logged",
+            "What skills do the top 5 highest-hour employees have?",
+            "Which department has the most diverse skill set?",
+            "List employees with Python skills who are assigned to projects",
+            "Show the number of skills vs hours logged per department",
+            "Which employees have data engineering skills but are not assigned to any project?"
+        ]
+    }
+
+    col_domain, col_result = st.columns([1, 2.5], gap="large")
+    with col_domain:
+        st.markdown("#### Focus Area")
+        with st.container(border=True):
+            selected_category = st.radio("Category", list(insight_categories.keys()), label_visibility="hidden")
+
+    with col_result:
+        st.markdown("#### Active Insight")
+        active_query = st.session_state.get("lib_active_query")
+        
+        if active_query:
+            with st.container(border=True):
+                st.markdown(f"**Question:** {active_query}")
+                st.divider()
+                
+                if st.session_state.get("lib_result") is None and st.session_state.get("lib_error") is None:
+                    with st.spinner("Analyzing with Cortex..."):
+                        api_history = [{"role": "user", "content": [{"type": "text", "text": active_query}]}]
+                        try:
+                            items, error = call_cortex_analyst(api_history)
+                            if error:
+                                st.session_state["lib_error"] = f"Cortex Analyst couldn't answer:\n\n{error}"
+                            else:
+                                ans_text, ans_df, ans_sql = "", None, None
+                                for item in items:
+                                    itype = item.get("type", "")
+                                    if itype == "text": ans_text += item.get("text", "") + "\n"
+                                    elif itype == "sql":
+                                        ans_sql = item.get("statement", "")
+                                        if ans_sql:
+                                            try:
+                                                ans_df = session.sql(ans_sql).to_pandas()
+                                                st.session_state.last_df = ans_df 
+                                            except Exception as sql_err: ans_text += f"\n\nSQL Error: {sql_err}"
+                                    elif itype == "suggestions" and item.get("suggestions", []):
+                                        ans_text += "\n**Try asking:**\n" + "\n".join(f"- {s}" for s in item.get("suggestions", []))
+                                
+                                st.session_state["lib_result"] = {
+                                    "text": ans_text.strip(),
+                                    "df": ans_df,
+                                    "sql": ans_sql
+                                }
+                        except Exception as e:
+                            st.session_state["lib_error"] = f"Unexpected error connecting to Cortex Analyst: {e}"
+                
+                if st.session_state.get("lib_error"):
+                    st.error(st.session_state["lib_error"])
+                
+                res = st.session_state.get("lib_result")
+                if res:
+                    if res.get("text"): st.markdown(res["text"])
+                    if res.get("df") is not None: st.dataframe(res["df"], use_container_width=True, hide_index=True)
+                    if res.get("sql"):
+                        with st.expander("View Generated SQL"): st.code(res["sql"], language="sql")
+        else:
+            st.info("Select a Focus Area from the left, then click any question globally below to generate an insight.")
+
+    st.write("")
+    st.divider()
+
+    st.markdown(f"### {selected_category} Questions")
+    st.caption("Click any question below to instantly query the workforce database via Cortex Analyst.")
+    
+    cols = st.columns(2)
+    for idx, question in enumerate(insight_categories[selected_category]):
+        if cols[idx % 2].button(f"{question}", use_container_width=True, key=f"btn_{idx}"):
+            st.session_state["lib_active_query"] = question
+            st.session_state["lib_result"] = None
+            st.session_state["lib_error"] = None
+            st.rerun()
